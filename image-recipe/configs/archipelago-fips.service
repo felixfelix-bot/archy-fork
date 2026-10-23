@@ -1,5 +1,17 @@
 [Unit]
 Description=Archipelago FIPS mesh transport (wraps upstream fips daemon)
+# Mutually exclusive with the package's own `fips.service`. Both run the same
+# binary against the same /etc/fips/fips.yaml, and both bind the fips0 TUN,
+# UDP 8668 and TCP 8443 — whichever starts first wins and the loser crash-loops
+# on "address already in use", leaving `fips.status` reporting a red service
+# while a daemon is in fact running. Archipelago owns the lifecycle (it
+# writes the config, the key and the firewall drop-ins), so the packaged unit
+# concedes.
+#
+# On a node where the daemon is supervised by the packaged unit instead — the
+# `active_unit()` / `activation_unit()` fallback in fips/service.rs — this
+# Conflicts= stops it, which is the intent: one daemon, one supervisor.
+Conflicts=fips.service
 # Stay dark until onboarding materialises the seed-derived key. Archipelago
 # backend unmasks + starts this unit via `sudo systemctl` once the key is
 # present; pre-onboarding the unit must be masked so no traffic is sent
@@ -14,8 +26,20 @@ ExecStartPre=/bin/sh -c 'test -x /usr/bin/fips || { echo "fips daemon not instal
 ExecStart=/usr/bin/fips --config /etc/fips/fips.yaml
 Restart=on-failure
 RestartSec=5
+# Back off between automatic restarts: 5s, 7s, 10s, 15s, 21s, then 30s. The
+# step count is cleared by a stop then start, a restart while the unit is
+# running, or systemctl reset-failed. Matches the packaged unit so daemon
+# restart behaviour does not change when the supervisor changes.
+RestartSteps=5
+RestartMaxDelaySec=30
+# Control socket dir (/run/fips/) — group-accessible so 'fips' group members
+# can run fipsctl/fipstop. Declared here too: when Archipelago supervises the
+# daemon the packaged unit never runs, so its RuntimeDirectory never applies.
+RuntimeDirectory=fips
+RuntimeDirectoryMode=0750
 # UDP 8668 is reachable on all interfaces by default; the daemon does its
 # own Noise authentication so no firewall gate is added here.
 
 [Install]
 WantedBy=multi-user.target
+

@@ -80,13 +80,22 @@ fn deb_arch() -> &'static str {
     }
 }
 
-/// Query GitHub for the latest stable release and compare to the installed
-/// version. Never errors on "no package installed" — that is itself a valid
-/// state where an update is available.
+/// Query GitHub for the latest stable release the generated config is known to
+/// be valid for, and compare to the installed version.
+///
+/// "Latest" is capped at [`VERIFIED_UPSTREAM_VERSION`]: the updater offers the
+/// newest release **at or below** the tag `fips::config` has been verified
+/// against, never merely the newest release that exists. Without the cap a
+/// node would silently move onto a daemon whose config schema nobody checked —
+/// which is how the `node.discovery.*` → `node.lookup.*`/`node.rendezvous.*`
+/// split (v0.5.0) would have gone unnoticed on an updating fleet.
+///
+/// Never errors on "no package installed" — that is itself a valid state where
+/// an update is available.
 pub async fn check() -> Result<UpdateCheck> {
     let current = service::daemon_version().await.ok();
     let client = http_client()?;
-    let release = fetch_latest_stable(&client).await?;
+    let release = fetch_verified_release(&client).await?;
 
     let update_available = match &current {
         Some(v) => version_is_older(v, &release.tag_name),
@@ -99,11 +108,26 @@ pub async fn check() -> Result<UpdateCheck> {
         .find(|a| is_deb_for_arch(&a.name))
         .map(|a| a.browser_download_url.clone());
 
+    let latest_overall = fetch_latest_stable(&client).await.ok();
     let notes = if update_available {
         format!(
             "Update available: {} (installed: {})",
             release.tag_name,
             current.as_deref().unwrap_or("not installed")
+        )
+    } else if let Some(overall) = latest_overall
+        .as_ref()
+        .filter(|o| version_is_older(&release.tag_name, &o.tag_name))
+    {
+        // Up to date against the cap, but newer upstream exists. Say so
+        // explicitly rather than reporting a bare "up to date" — otherwise a
+        // node holding a known-good version looks like it is on the newest
+        // release, and nobody ever learns the cap is stale.
+        format!(
+            "Up to date at the verified ceiling {}. Newer upstream release {} \
+             exists but is not verified for this build — bump \
+             VERIFIED_UPSTREAM_VERSION first.",
+            release.tag_name, overall.tag_name
         )
     } else {
         format!("Up to date ({})", release.tag_name)
@@ -124,7 +148,10 @@ pub async fn check() -> Result<UpdateCheck> {
 /// → download .deb + checksums → SHA256-verify → `sudo dpkg -i` → restart.
 pub async fn apply() -> Result<()> {
     let client = http_client()?;
-    let release = fetch_latest_stable(&client).await?;
+    // Same cap as `check()`. Using `/releases/latest` here would install a
+    // daemon the UI never offered — and, worse, one whose config schema is
+    // unverified — while `check()` reported "up to date".
+    let release = fetch_verified_release(&client).await?;
 
     let deb = release
         .assets
@@ -295,6 +322,67 @@ async fn fetch_latest_stable(client: &reqwest::Client) -> Result<Release> {
     Ok(release)
 }
 
+/// The newest stable release at or below [`VERIFIED_UPSTREAM_VERSION`].
+///
+/// Lists releases rather than using `/releases/latest` because the cap can sit
+/// several releases behind the newest one — and does, by construction: the cap
+/// only moves when somebody bumps it deliberately. Entries are walked newest
+/// first and the first stable tag ≤ the cap wins.
+///
+/// Falls back to `/releases/latest` when the cap itself cannot be satisfied
+/// (e.g. a tag was withdrawn upstream), so a node is never left unable to
+/// update at all — but it says so loudly rather than silently uncapping.
+async fn fetch_verified_release(client: &reqwest::Client) -> Result<Release> {
+    let url = format!(
+        "{}/repos/{}/releases?per_page=100",
+        GITHUB_API, UPSTREAM_REPO
+    );
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .context("GitHub releases API")?;
+
+    if resp.status().is_success() {
+        let releases: Vec<Release> = resp.json().await.context("Parse releases JSON")?;
+        let mut candidates: Vec<Release> = releases
+            .into_iter()
+            .filter(|r| !r.draft && !r.prerelease)
+            // Keep only tags at or below the verified ceiling.
+            .filter(|r| !version_is_older(VERIFIED_UPSTREAM_VERSION, &r.tag_name))
+            .collect();
+        // Newest first by semantic version, independent of API ordering.
+        candidates.sort_by(|a, b| {
+            version_sort_key(&b.tag_name)
+                .cmp(&version_sort_key(&a.tag_name))
+        });
+        if let Some(best) = candidates.into_iter().next() {
+            return Ok(best);
+        }
+    }
+
+    tracing::warn!(
+        cap = VERIFIED_UPSTREAM_VERSION,
+        "no upstream release at or below the verified ceiling ({}); \
+         falling back to releases/latest — the config schema is UNVERIFIED for it",
+        VERIFIED_UPSTREAM_VERSION
+    );
+    fetch_latest_stable(client).await
+}
+
+/// Sort key for a release tag: `(major, minor, patch)`.
+///
+/// Build metadata and pre-release suffixes sort as the release they attach to;
+/// pre-releases are filtered out before this is used, so the simplification is
+/// safe here and avoids a semver dependency for one comparison.
+fn version_sort_key(tag: &str) -> (u64, u64, u64) {
+    match parse_version(tag) {
+        Some((core, _)) => core,
+        None => (0, 0, 0),
+    }
+}
+
 fn is_deb_for_arch(name: &str) -> bool {
     name.starts_with("fips_") && name.ends_with(&format!("_{}.deb", deb_arch()))
 }
@@ -397,5 +485,58 @@ mod tests {
         assert!(json.contains("latest_version"));
         assert!(json.contains("update_available"));
         assert!(json.contains("stable"));
+    }
+
+    /// The ceiling must be a real semantic version, and the ISO pin must match
+    /// it. Drift between the two is the exact failure this constant exists to
+    /// prevent: the shipped image and the runtime updater would disagree about
+    /// which daemon version the config is written for.
+    #[test]
+    fn test_verified_ceiling_matches_the_iso_pin() {
+        assert_eq!(
+            parse_version(super::super::VERIFIED_UPSTREAM_VERSION).map(|(c, pre)| (c, pre)),
+            Some(((0, 5, 3), false)),
+            "VERIFIED_UPSTREAM_VERSION must be a plain release triple"
+        );
+        let iso = include_str!("../../../../../image-recipe/_archived/build-auto-installer-iso.sh");
+        let pin = iso
+            .lines()
+            .find_map(|l| l.strip_prefix("ARG FIPS_VERSION="))
+            .map(str::trim)
+            .expect("ISO builder declares ARG FIPS_VERSION");
+        assert_eq!(
+            pin.trim_start_matches('v'),
+            super::super::VERIFIED_UPSTREAM_VERSION,
+            "ISO pin ({pin}) and VERIFIED_UPSTREAM_VERSION disagree — \
+             bump them together"
+        );
+    }
+
+    /// A release newer than the ceiling must be excluded, and the ceiling
+    /// itself must be included. This is the whole point of the cap.
+    #[test]
+    fn test_cap_excludes_newer_releases() {
+        let cap = super::super::VERIFIED_UPSTREAM_VERSION;
+        // At or below the cap: keep.
+        assert!(!version_is_older(cap, "v0.5.3"));
+        assert!(!version_is_older(cap, "v0.5.2"));
+        assert!(!version_is_older(cap, "v0.4.1"));
+        // Above the cap: exclude.
+        assert!(version_is_older(cap, "v0.5.4"));
+        assert!(version_is_older(cap, "v0.6.0"));
+        assert!(version_is_older(cap, "v1.0.0"));
+    }
+
+    /// `version_sort_key` must order tags semantically, not lexically —
+    /// `v0.5.10` is newer than `v0.5.9`, which string ordering gets wrong.
+    #[test]
+    fn test_version_sort_key_is_semantic() {
+        let mut tags = vec!["v0.4.1", "v0.5.10", "v0.5.3", "v0.5.9", "v0.5.2"];
+        tags.sort_by(|a, b| version_sort_key(b).cmp(&version_sort_key(a)));
+        assert_eq!(
+            tags,
+            vec!["v0.5.10", "v0.5.9", "v0.5.3", "v0.5.2", "v0.4.1"],
+            "release list must sort by semantic version, newest first"
+        );
     }
 }

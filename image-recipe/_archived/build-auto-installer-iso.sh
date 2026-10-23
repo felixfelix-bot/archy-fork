@@ -296,8 +296,15 @@ if [ ! -f "$ROOTFS_TAR" ] || [ "${1:-}" == "--rebuild" ] || [ "$(cat "$ROOTFS_ST
 # protocol archipelago uses as its preferred non-Tor transport.
 # Pinned so the shipped version is knowable: an unpinned --depth 1 clone of
 # main made every ISO carry whatever upstream happened to be that day.
-# v0.4.1 is the version fips/config.rs renders its typed config against and
+# v0.5.3 is the version fips/config.rs renders its typed config against and
 # the one validated in the field. Bump the two together.
+#
+# Bumping this ARG alone is NOT sufficient — three things move with it:
+#   1. core/archipelago/src/fips/config.rs (typed schema + snapshot test)
+#   2. tests/fixtures/fips/fips-<tag>.yaml (verbatim upstream example)
+#   3. the runtime updater's version ceiling, if the bump is pinned
+# Run `scripts/verify-fips-fixtures.sh` after editing; it re-downloads the
+# upstream example at this tag and fails on drift.
 # The .deb is rebuilt every ISO build; Docker layer caching keeps the
 # incremental cost low. Failure here fails the ISO build on purpose:
 # we don't want to ship an ISO that silently skips FIPS.
@@ -315,7 +322,7 @@ RUN apt-get -o Acquire::ForceIPv4=true update && apt-get -o Acquire::ForceIPv4=t
     clang libclang-dev libnftnl-dev libmnl-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install --locked cargo-deb
-ARG FIPS_VERSION=v0.4.1
+ARG FIPS_VERSION=v0.5.3
 RUN git clone --depth 1 --branch "$FIPS_VERSION" \
     https://github.com/jmcorgan/fips.git /src/fips
 WORKDIR /src/fips

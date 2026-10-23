@@ -28,6 +28,10 @@
 pub mod anchors;
 pub mod app_ports;
 pub mod config;
+/// Contract tests asserting the generated `fips.yaml` against the verbatim
+/// upstream example at the pinned tag. Test-only module — see the file header.
+#[cfg(test)]
+mod config_upstream_contract;
 pub mod dial;
 pub mod endpoints;
 pub mod iface;
@@ -164,8 +168,29 @@ pub const DAEMON_KEY_PATH: &str = "/etc/fips/fips.key";
 /// Path the FIPS daemon reads its public key from.
 pub const DAEMON_PUB_PATH: &str = "/etc/fips/fips.pub";
 
-/// Upstream repository the updater tracks (branch `main`).
+/// Upstream repository the updater tracks.
 pub const UPSTREAM_REPO: &str = "jmcorgan/fips";
+
+/// Highest upstream release whose config schema and key paths
+/// `fips::config::render_config_yaml()` has been verified against.
+///
+/// The ISO pins exactly this tag (`ARG FIPS_VERSION` in
+/// `image-recipe/_archived/build-auto-installer-iso.sh`), and the contract
+/// tests in `fips::config_upstream_contract` assert the generated config
+/// against the verbatim upstream artefacts at it.
+///
+/// The runtime updater previously floated to whatever `/releases/latest`
+/// returned, with no ceiling. That made the "verified against <tag>" claim in
+/// `config.rs` and this module false the moment an operator pressed Update:
+/// a node would run a daemon whose schema nobody had checked, against a config
+/// written for an older one. Upstream has since split `node.discovery.*` into
+/// `node.lookup.*` + `node.rendezvous.*` (v0.5.0) and tightened config
+/// validation (v0.5.3 refuses to start on a config that configures nothing),
+/// so "latest is probably fine" is not a safe assumption to ship on.
+///
+/// Bumping this constant is the LAST step of a version bump, after the config
+/// module, the fixtures and the contract tests all move together.
+pub const VERIFIED_UPSTREAM_VERSION: &str = "0.5.3";
 
 /// Default UDP port the daemon listens on.
 pub const DEFAULT_UDP_PORT: u16 = 8668;
