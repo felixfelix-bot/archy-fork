@@ -498,7 +498,7 @@ mod tests {
             Some(((0, 5, 3), false)),
             "VERIFIED_UPSTREAM_VERSION must be a plain release triple"
         );
-        let iso = include_str!("../../../../../image-recipe/_archived/build-auto-installer-iso.sh");
+        let iso = include_str!("../../../../image-recipe/_archived/build-auto-installer-iso.sh");
         let pin = iso
             .lines()
             .find_map(|l| l.strip_prefix("ARG FIPS_VERSION="))
