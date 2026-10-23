@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{service, UPSTREAM_REPO};
+use super::{service, UPSTREAM_REPO, VERIFIED_UPSTREAM_VERSION};
 
 const GITHUB_API: &str = "https://api.github.com";
 const USER_AGENT: &str = "archipelago-fips-updater";
