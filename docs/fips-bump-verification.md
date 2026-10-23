@@ -134,7 +134,16 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0
 `CARGO_PROFILE_TEST_OPT_LEVEL=0` is an environment override only — the repo's
 `Cargo.toml` is unchanged, so CI is unaffected.
 
-## 7. Not yet verified
+## 7. Full-suite failures are pre-existing
+
+The full `archipelago` bin suite reports 9 failures. All 9 reproduce on pristine
+`main` at `fcc18b3` (8 identically; the ninth is timing-flaky under load), and
+this branch's diff touches no `container/`, `wallet/` or `bootstrap` file.
+Details and the side-by-side result table: `docs/preexisting-test-failures.md`.
+
+Scoped result for this change: `fips::` — 72 passed, 0 failed.
+
+## 8. Not yet verified
 
 - **ISO build.** `cmake`-free Docker build of the `.deb` at v0.5.3 and the
   rootfs were not run here. Layer caching means this is cheap, but it has not
