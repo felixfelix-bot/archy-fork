@@ -52,6 +52,48 @@ Consequence: the PR body and the unit comment claim an invariant the artifacts d
 not enforce. The original defect (two units crash-looping on the same ports) is
 *made less likely*, not eliminated.
 
+## Empirical confirmation (transient probe units, 2026-10-25)
+
+Reasoning about systemd semantics is not evidence, so this was measured on the
+host with two throwaway units mirroring the real relationship — each declaring
+`Conflicts=` on the other, both `WantedBy=multi-user.target`, `Type=simple`
+`ExecStart=/bin/sleep 120`:
+
+```
+# start A, then start B (B declares Conflicts=A)
+A=active  B=inactive
+A=inactive B=active        ← starting B STOPPED A
+
+# start B, then start A (A declares Conflicts=B)
+B=active
+A=active  B=inactive       ← starting A STOPPED B
+```
+
+So `Conflicts=` does work in both directions, and **the unit that is started
+second is the one that survives.** That is exactly the review's point: the
+directive makes the collision non-simultaneous, and nothing in it designates
+which unit should win.
+
+The decisive consequence, read from the host:
+
+```
+$ systemctl list-dependencies --reverse fips.service
+fips.service
+● └─multi-user.target
+●   └─graphical.target
+```
+
+`fips.service` is reachable from `multi-user.target` with **no ordering
+constraint against `archipelago-fips.service`**. At boot systemd will start it,
+and per the measurement above that start **stops `archipelago-fips.service`** —
+in whichever order the transaction happens to resolve. The `Conflicts=` line
+therefore does not protect the supervisor the design intends to keep; it only
+ensures the two never run at once.
+
+The probe units were removed and `daemon-reload` run; the host's real
+`fips.service` was never stopped (`systemctl is-active fips.service` → `active`).
+
+
 ## The honest options
 
 **A. Mask the packaged unit from the image (recommended for the ISO path).**
