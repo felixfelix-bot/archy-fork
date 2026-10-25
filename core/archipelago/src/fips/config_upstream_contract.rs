@@ -94,6 +94,50 @@ fn emitted_paths() -> BTreeSet<String> {
     out
 }
 
+/// The set of paths archipelago deliberately OWNS — the tuning it must apply.
+///
+/// This is the third of three sets, and the one that was previously unchecked:
+///
+///   * `owned`  ⊆ `emitted`  ← this module's new assertion
+///   * `emitted` ⊆ `schema`  ← `every_path_we_emit_is_valid_upstream`
+///   * `schema` is genuine   ← `fixture_is_a_real_upstream_config`
+///
+/// Without the first direction, nothing failed if a future edit dropped
+/// `node.retry.*` or `node.rate_limit.*` from the renderer. `emitted ⊆ schema`
+/// stays vacuously true as `emitted` shrinks, and the exact-output snapshot in
+/// `config.rs` can simply be updated to match a wrong config — so the file
+/// that is supposed to catch a lost setting would have blessed its absence.
+fn owned_paths() -> BTreeSet<String> {
+    [
+        // The mesh-lookup scalars this project tunes (formerly node.discovery.*).
+        "node.lookup.backoff_base_secs",
+        "node.lookup.backoff_max_secs",
+        // mDNS LAN rendezvous — on by default for co-located nodes.
+        "node.rendezvous.lan.enabled",
+        // Fast-reconnect profile: upstream's 5s→300s default left a node
+        // off-mesh for ~90s after a recycled anchor.
+        "node.retry.base_interval_secs",
+        "node.retry.max_backoff_secs",
+        "node.retry.max_retries",
+        // Handshake resend pacing during the connect window.
+        "node.rate_limit.handshake_resend_interval_ms",
+        "node.rate_limit.handshake_resend_backoff",
+        "node.rate_limit.handshake_max_resends",
+        // Identity + interfaces + transports the app depends on.
+        "node.identity.persistent",
+        "tun.enabled",
+        "tun.name",
+        "tun.mtu",
+        "dns.enabled",
+        "dns.bind_addr",
+        "transports.udp.bind_addr",
+        "transports.tcp.bind_addr",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 // ─────────────────────────── fixture integrity ───────────────────────────
 
 #[test]
@@ -148,6 +192,47 @@ fn schema_fixture_covers_the_paths_we_own() {
 }
 
 // ───────────────────────── the actual contract ─────────────────────────
+
+/// The missing direction: everything we OWN must actually be emitted.
+///
+/// Without this, `emitted ⊆ schema` stays true while `emitted` quietly shrinks,
+/// and a renderer edit that dropped `node.retry.*` would ship a node with
+/// upstream's 5s→300s reconnect behaviour while every test passed. The other
+/// tests cannot catch it: the exact snapshot in `config.rs` would simply be
+/// updated to match, and `emitted ⊆ schema` is monotone in shrinking `emitted`.
+#[test]
+fn everything_we_own_is_actually_emitted() {
+    let emitted = emitted_paths();
+    let missing: Vec<String> = owned_paths()
+        .into_iter()
+        .filter(|p| !emitted.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the generated fips.yaml no longer emits paths this project owns: {missing:?}\n\
+         A dropped tuning key is silent upstream (no deny_unknown_fields on the \
+         root Config), so nothing else would catch it: the config would simply \
+         lose that setting on every node."
+    );
+}
+
+/// The owned set must itself be real: every owned path must exist upstream, or
+/// this module would enshrine a key upstream never defined — the exact defect
+/// (`node.discovery.{timeout_secs,…}`) the bump removed.
+#[test]
+fn every_owned_path_exists_upstream() {
+    let schema = upstream_paths();
+    let bogus: Vec<String> = owned_paths()
+        .into_iter()
+        .filter(|p| !schema.contains(p))
+        .collect();
+    assert!(
+        bogus.is_empty(),
+        "owned_paths() lists paths upstream {PINNED_UPSTREAM_TAG} does not accept: {bogus:?}\n\
+         An owned key that upstream does not define is ignored silently — this is \
+         the phantom-key defect re-entering through the allowlist itself."
+    );
+}
 
 #[test]
 fn every_path_we_emit_is_valid_upstream() {
