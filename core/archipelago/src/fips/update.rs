@@ -322,16 +322,42 @@ async fn fetch_latest_stable(client: &reqwest::Client) -> Result<Release> {
     Ok(release)
 }
 
-/// The newest stable release at or below [`VERIFIED_UPSTREAM_VERSION`].
+/// The newest stable release at or below a ceiling.
 ///
 /// Lists releases rather than using `/releases/latest` because the cap can sit
 /// several releases behind the newest one — and does, by construction: the cap
 /// only moves when somebody bumps it deliberately. Entries are walked newest
-/// first and the first stable tag ≤ the cap wins.
+/// first and the first stable tag ≤ the ceiling wins.
 ///
-/// Falls back to `/releases/latest` when the cap itself cannot be satisfied
-/// (e.g. a tag was withdrawn upstream), so a node is never left unable to
-/// update at all — but it says so loudly rather than silently uncapping.
+/// **Fails closed.** It does NOT fall back to `/releases/latest` when no
+/// in-ceiling candidate exists. An earlier revision did, "so a node is never
+/// left unable to update at all" — but that made the ceiling advisory: a 403
+/// (rate limit), a transient 5xx, or a withdrawn tag each silently produced the
+/// newest release upstream, whose config schema is unverified, and `apply()`
+/// would install it. That is precisely the failure the ceiling exists to stop.
+/// Refusing to update is recoverable; installing an unverified daemon onto a
+/// live node is not.
+///
+/// Pure over the release list so the policy is testable without HTTP.
+fn select_verified_release<'a>(releases: &'a [Release], ceiling: &str) -> Result<&'a Release> {
+    releases
+        .iter()
+        .filter(|r| !r.draft && !r.prerelease)
+        // At or below the ceiling only.
+        .filter(|r| !version_is_older(ceiling, &r.tag_name))
+        .max_by_key(|r| version_sort_key(&r.tag_name))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no stable upstream release at or below the verified ceiling {ceiling}. \
+                 Refusing to update: any newer release's config schema is unverified for \
+                 this build. Bump VERIFIED_UPSTREAM_VERSION (and its fixtures) once the \
+                 newer schema is verified."
+            )
+        })
+}
+
+/// Fetch the release list and select within the ceiling. Errors rather than
+/// uncapping — see [`select_verified_release`].
 async fn fetch_verified_release(client: &reqwest::Client) -> Result<Release> {
     let url = format!(
         "{}/repos/{}/releases?per_page=100",
@@ -344,31 +370,15 @@ async fn fetch_verified_release(client: &reqwest::Client) -> Result<Release> {
         .await
         .context("GitHub releases API")?;
 
-    if resp.status().is_success() {
-        let releases: Vec<Release> = resp.json().await.context("Parse releases JSON")?;
-        let mut candidates: Vec<Release> = releases
-            .into_iter()
-            .filter(|r| !r.draft && !r.prerelease)
-            // Keep only tags at or below the verified ceiling.
-            .filter(|r| !version_is_older(VERIFIED_UPSTREAM_VERSION, &r.tag_name))
-            .collect();
-        // Newest first by semantic version, independent of API ordering.
-        candidates.sort_by(|a, b| {
-            version_sort_key(&b.tag_name)
-                .cmp(&version_sort_key(&a.tag_name))
-        });
-        if let Some(best) = candidates.into_iter().next() {
-            return Ok(best);
-        }
-    }
+    // A non-2xx is an ERROR, not a reason to reach for the uncapped endpoint.
+    let releases: Vec<Release> = resp
+        .error_for_status()
+        .context("GitHub releases API returned an error status")?
+        .json()
+        .await
+        .context("Parse releases JSON")?;
 
-    tracing::warn!(
-        cap = VERIFIED_UPSTREAM_VERSION,
-        "no upstream release at or below the verified ceiling ({}); \
-         falling back to releases/latest — the config schema is UNVERIFIED for it",
-        VERIFIED_UPSTREAM_VERSION
-    );
-    fetch_latest_stable(client).await
+    Ok(select_verified_release(&releases, VERIFIED_UPSTREAM_VERSION)?.clone())
 }
 
 /// Sort key for a release tag: `(major, minor, patch)`.
@@ -527,8 +537,92 @@ mod tests {
         assert!(version_is_older(cap, "v1.0.0"));
     }
 
-    /// `version_sort_key` must order tags semantically, not lexically —
-    /// `v0.5.10` is newer than `v0.5.9`, which string ordering gets wrong.
+    /// The ceiling must FAIL CLOSED. Every case where no in-ceiling candidate
+    /// exists must be an error — never the newest release overall.
+    ///
+    /// Regression guard: an earlier revision fell back to `/releases/latest`
+    /// here, so a rate-limited or failing release-list call silently produced
+    /// an uncapped release, and `apply()` would install it. These assertions
+    /// fail against that revision.
+    #[test]
+    fn test_selection_fails_closed_rather_than_uncapping() {
+        let cap = super::super::VERIFIED_UPSTREAM_VERSION;
+        let rel = |tag: &str| Release {
+            tag_name: tag.to_string(),
+            draft: false,
+            prerelease: false,
+            assets: Vec::new(),
+        };
+
+        // Nothing at or below the ceiling ⇒ ERROR, not the newest release.
+        let all_newer = vec![rel("v9.9.9"), rel("v0.6.0")];
+        let err = select_verified_release(&all_newer, cap)
+            .expect_err("a list with no in-ceiling candidate must NOT uncap");
+        assert!(
+            err.to_string().contains(cap),
+            "the error must name the ceiling; got: {err}"
+        );
+
+        // An empty list ⇒ ERROR (this is the rate-limit / withdrawn-tag shape).
+        assert!(
+            select_verified_release(&[], cap).is_err(),
+            "an empty release list must not fall through to an uncapped release"
+        );
+
+        // Only drafts/prereleases ⇒ ERROR. They must not be installable either.
+        let mut d = rel("v0.4.1");
+        d.draft = true;
+        let mut p = rel("v0.5.0");
+        p.prerelease = true;
+        assert!(
+            select_verified_release(&[d, p], cap).is_err(),
+            "draft/prerelease entries must not satisfy the ceiling"
+        );
+    }
+
+    /// Within the ceiling, the newest wins — and the ceiling itself is eligible.
+    /// This is the other half of the policy: failing closed must not mean
+    /// refusing to update when a perfectly good in-ceiling release exists.
+    #[test]
+    fn test_selection_picks_newest_within_the_ceiling() {
+        let cap = super::super::VERIFIED_UPSTREAM_VERSION; // v0.5.3
+        let rel = |tag: &str| Release {
+            tag_name: tag.to_string(),
+            draft: false,
+            prerelease: false,
+            assets: Vec::new(),
+        };
+        // Newer-than-cap entries present and ignored; the ceiling itself wins
+        // over older in-cap releases. Order is deliberately unsorted to prove
+        // the selection is semantic, not positional.
+        let list = vec![rel("v0.4.1"), rel("v0.6.0"), rel("v0.5.3"), rel("v0.5.2")];
+        let got = select_verified_release(&list, cap).expect("an in-ceiling release exists");
+        // The release carries the upstream tag form (`v0.5.3`); `cap` is the
+        // bare triple. Compare against the tag, not the constant.
+        assert_eq!(got.tag_name, format!("v{cap}"));
+
+        // A withdrawn ceiling must degrade to the next-newest in-cap release,
+        // NOT to an above-cap one.
+        let list = vec![rel("v0.4.1"), rel("v0.6.0"), rel("v0.5.2")];
+        let got = select_verified_release(&list, cap).expect("an in-ceiling release exists");
+        assert_eq!(got.tag_name, "v0.5.2");
+    }
+
+    /// A semantic order check: v0.5.10 must beat v0.5.9 within the ceiling.
+    /// String ordering gets this wrong, so it is worth an explicit case.
+    #[test]
+    fn test_selection_is_semantic_not_lexical() {
+        let rel = |tag: &str| Release {
+            tag_name: tag.to_string(),
+            draft: false,
+            prerelease: false,
+            assets: Vec::new(),
+        };
+        let list = vec![rel("v0.5.9"), rel("v0.5.10"), rel("v0.5.2")];
+        let got = select_verified_release(&list, "0.5.10").expect("v0.5.10 is in ceiling");
+        assert_eq!(got.tag_name, "v0.5.10");
+    }
+
     #[test]
     fn test_version_sort_key_is_semantic() {
         let mut tags = vec!["v0.4.1", "v0.5.10", "v0.5.3", "v0.5.9", "v0.5.2"];
