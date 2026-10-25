@@ -143,12 +143,96 @@ Details and the side-by-side result table: `docs/preexisting-test-failures.md`.
 
 Scoped result for this change: `fips::` — 72 passed, 0 failed.
 
-## 8. Not yet verified
+## 8. ISO-shipped package (now verified)
 
-- **ISO build.** `cmake`-free Docker build of the `.deb` at v0.5.3 and the
-  rootfs were not run here. Layer caching means this is cheap, but it has not
-  been observed.
-- **Real node.** Unit tests prove the config is schema-valid. They do not prove
-  the daemon starts with it, that the node re-peers after upgrade, or that the
-  mesh returns. `fipsctl show peers` on a live node is still outstanding.
+`scripts/build-fips-deb-proof.sh` extracts the FIPS builder stage **verbatim**
+from the ISO builder (`image-recipe/_archived/build-auto-installer-iso.sh`) and
+asserts the resulting package, so "the bump compiles" is separated from "the ISO
+carries the bumped daemon".
+
+```
+$ sudo bash scripts/build-fips-deb-proof.sh
+STEP 10/10: RUN cp target/debian/fips_*_amd64.deb /tmp/fips.deb
+── assertions ──
+sha256: f4c8baa17afdb16ca5ab742074b597d97d00d45a272c554e0d96f682c08760dd
+size:   8338444 bytes
+package: fips
+version: 0.5.3-1
+OK: version matches pin v0.5.3
+OK: contains ./usr/bin/fips
+OK: contains ./usr/bin/fipsctl
+RESULT: PASS -- ISO-shipped FIPS package is fips 0.5.3-1 at pin v0.5.3
+```
+
+The version check is deliberately not sufficient on its own: a package that
+unpacks without the daemon binary would pass it and ship a node with no mesh.
+Cold `cargo build --release` took ~4m33s.
+
+Caveat: this is the ISO's **FIPS package**, not a bootable ISO. A full ISO build
+still needs a `debootstrap`/`mksquashfs`/`xorriso` run against a build server.
+
+## 9. Real daemon, real peering (now verified)
+
+Unit tests prove the config is schema-valid. `scripts/fips-live-smoke.sh` proves
+a real daemon accepts it and that the observable subset takes effect: two
+daemons on a veth pair, each in its own network **and mount** namespace, each
+fed the rendered config, mutually authenticating.
+
+```
+$ sudo bash scripts/fips-live-smoke.sh
+daemon: fips 0.5.3 (rev f4a5b4a8e6)
+OK:   node a: daemon accepted the rendered config and came up
+OK:   node b: daemon accepted the rendered config and came up
+OK:   node a: daemon confined to netns inode 4026533093 (host is 4026531833)
+OK:   node b: daemon confined to netns inode 4026533151 (host is 4026531833)
+OK:   mutual peering: node a sees 1, node b sees 1
+OK:   node a: authenticated peer list contains node b's npub (npub1wt8xp7y...)
+OK:   node b: authenticated peer list contains node a's npub (npub185l8hzu...)
+OK:   node a: mesh address resolves from its identity (fd1c:77c3:...:38f4)
+RESULT: PASS -- archipelago's rendered config boots a real v0.5.3 daemon and peers
+```
+
+### What this does and does not prove
+
+Upstream's root `Config` carries **no `deny_unknown_fields`** (only the peer
+types do: `src/config/peer.rs:98,191`), so a key upstream never defined is
+dropped in silence and the daemon starts anyway. That is precisely the defect
+this branch removes, and **no live run can distinguish a recognised key from an
+ignored one**. This test asserts the config is accepted and its observable
+effects hold — transports bind, TUN activates, mDNS rendezvous peers. The
+key-path half is asserted against upstream's own schema by
+`config_upstream_contract.rs`, and deliberately not here.
+
+### Three environment traps, each of which produced a false pass
+
+Recorded because each one made the test look like it had PASSED:
+
+1. **Shared mount namespace.** `ip netns exec` separates the network stack but
+   not mounts, and the control socket path is fixed (`/run/fips/control.sock`).
+   The first revision read the **host** fleet daemon — peers `andre`, `dq05`,
+   `cobrador` — and reported success while the nodes under test had zero peers.
+   Proven by inode: the "node a" socket was the host's, inode 2726, dated a day
+   earlier. The daemon now gets a fresh tmpfs `/run`, and a guard fails loudly
+   if peer output ever names a known host peer.
+2. **Fleet ACL.** The host's `/etc/fips/peers.deny` is `ALL` (allowlist-strict),
+   so the handshake was refused: `WARN fips::node::acl: Rejected peer by ACL …
+   decision=denylist match`. The ACL paths are hardcoded constants, not config
+   keys, and upstream treats an **absent** file as an empty policy — so the
+   harness mounts an empty `/etc/fips` rather than editing the host's deliberate
+   fleet policy.
+3. **Stale identity.** An npub captured before boot cannot match after key
+   regeneration, which produced a false FAIL on a passing run. Identities are now
+   read from the files the daemons actually loaded.
+
+A fourth, found earlier: `fipsctl address` prints a **mesh IPv6 address**, not an
+npub, so feeding its output to `connect` yields `unknown host '<fd…>'`.
+
+## 10. Not yet verified
+
+- **Full bootable ISO.** The FIPS package is proven (§8); a `debootstrap` +
+  `mksquashfs` + `xorriso` ISO build was not run.
+- **Upgrade-in-place on a real node.** The smoke test boots fresh daemons. It
+  does not prove the mesh *returns* after upgrading an existing node with a
+  v0.4.1-shaped config in place — though that is the case
+  `VERIFIED_UPSTREAM_VERSION` exists to cap.
 - **Android companion.** Out of scope by design — see ADR-012.
