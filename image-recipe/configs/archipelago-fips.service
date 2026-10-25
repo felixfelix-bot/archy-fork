@@ -4,9 +4,15 @@ Description=Archipelago FIPS mesh transport (wraps upstream fips daemon)
 # binary against the same /etc/fips/fips.yaml, and both bind the fips0 TUN,
 # UDP 8668 and TCP 8443 — whichever starts first wins and the loser crash-loops
 # on "address already in use", leaving `fips.status` reporting a red service
-# while a daemon is in fact running. Archipelago owns the lifecycle (it
-# writes the config, the key and the firewall drop-ins), so the packaged unit
-# concedes.
+# while a daemon is in fact running.
+#
+# `Conflicts=` is SYMMETRIC: it stops whichever of the two starts second, and
+# does not by itself make the packaged unit yield. So this directive makes the
+# collision non-simultaneous, not impossible — the units are still both
+# `WantedBy=multi-user.target`, and ordering decides the winner. Making
+# archipelago the sole supervisor by construction needs the packaged unit
+# masked from the image; see docs/findings-fips-unit-conflicts.md for the
+# evidence and the options. Do not "fix" that by removing this line.
 #
 # On a node where the daemon is supervised by the packaged unit instead — the
 # `active_unit()` / `activation_unit()` fallback in fips/service.rs — this
