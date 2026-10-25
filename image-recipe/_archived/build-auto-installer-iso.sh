@@ -649,6 +649,37 @@ RUN systemctl enable archipelago-fips.service || true
 RUN rm -f /etc/systemd/system/nostr-vpn.service && \
     ln -sf /dev/null /etc/systemd/system/nostr-vpn.service
 
+# ─── Mask the packaged FIPS unit: archipelago owns the daemon lifecycle ────
+#
+# The FIPS .deb installed above ships AND enables /usr/lib/systemd/system/fips.service,
+# and its postinst runs `systemctl enable`. Both it and
+# archipelago-fips.service are WantedBy=multi-user.target and bind the same
+# fips0 TUN, UDP 8668 and TCP 8443.
+#
+# archipelago-fips.service declares `Conflicts=fips.service`, but that is
+# SYMMETRIC: measured 2026-10-25 with two throwaway units, whichever unit starts
+# SECOND survives. fips.service hangs off multi-user.target with no ordering
+# constraint against ours, so at boot systemd starts it and that start stops
+# archipelago-fips.service. Conflicts= therefore prevents SIMULTANEOUS execution
+# but does not protect the supervisor we intend to keep. Evidence and options:
+# docs/findings-fips-unit-conflicts.md.
+#
+# Masking makes the packaged unit unstartable, so the invariant stops depending
+# on boot ordering. Same rm + /dev/null technique as nostr-vpn above, for the
+# same reason: a bare `systemctl mask` in a container build touches the build
+# container's runtime state, which does not survive into the image, and does not
+# remove the real unit file dpkg extracted.
+#
+# Ordering matters: this MUST come after the `.deb` install, otherwise dpkg's
+# postinst re-creates the unit and silently undoes the mask. Asserted by
+# tests/regression/fips-service-masked.py, which fails if the two are reversed.
+#
+# Nodes that are NOT ISO-built (upstream-package-only installs) never receive
+# this mask, so `fips::service::activation_unit()` still falls back to
+# fips.service there — that fallback is for exactly those nodes and stays valid.
+RUN rm -f /etc/systemd/system/fips.service && \
+    ln -sf /dev/null /etc/systemd/system/fips.service
+
 # Remove policy-rc.d so services can start on first boot
 RUN rm -f /usr/sbin/policy-rc.d
 

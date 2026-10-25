@@ -6,13 +6,14 @@ Description=Archipelago FIPS mesh transport (wraps upstream fips daemon)
 # on "address already in use", leaving `fips.status` reporting a red service
 # while a daemon is in fact running.
 #
-# `Conflicts=` is SYMMETRIC: it stops whichever of the two starts second, and
-# does not by itself make the packaged unit yield. So this directive makes the
-# collision non-simultaneous, not impossible — the units are still both
-# `WantedBy=multi-user.target`, and ordering decides the winner. Making
-# archipelago the sole supervisor by construction needs the packaged unit
-# masked from the image; see docs/findings-fips-unit-conflicts.md for the
-# evidence and the options. Do not "fix" that by removing this line.
+# `Conflicts=` is SYMMETRIC: whichever of the two starts second survives, so
+# the directive makes the collision non-simultaneous but designates no winner.
+# The ISO now masks the packaged unit by construction (build-auto-installer-iso.sh,
+# after the .deb install), making archipelago the sole supervisor on ISO-built
+# nodes. Conflicts= stays as a second line of defence for nodes that were NOT
+# ISO-built and therefore never receive the mask — the activation_unit()
+# fallback to fips.service exists for exactly those nodes and stays valid.
+# Evidence and the reason masking is necessary: docs/findings-fips-unit-conflicts.md.
 #
 # On a node where the daemon is supervised by the packaged unit instead — the
 # `active_unit()` / `activation_unit()` fallback in fips/service.rs — this
