@@ -45,9 +45,27 @@ config generated for v0.4.1 — a version nobody had verified.
 1. **The image pin and the runtime updater share one ceiling.**
    `fips::VERIFIED_UPSTREAM_VERSION` names the newest upstream release whose
    schema this build is verified against. `update::check()` and
-   `update::apply()` both resolve releases against it; neither can install or
-   offer a version above it. `check()` says so explicitly when newer upstream
-   exists, so a stale cap is visible instead of masquerading as "up to date".
+   `update::apply()` both resolve releases against it — a release above the
+   ceiling is neither offered nor installed. `check()` says so explicitly when
+   newer upstream exists, so a stale cap is visible instead of masquerading as
+   "up to date".
+
+   **Correction (this revision).** An earlier version of this ADR read "neither
+   can install or offer a version above it" as an unconditional property. It was
+   not: `fetch_verified_release()` fell back to `/releases/latest` whenever the
+   release *list* call did not yield an in-ceiling candidate — on a non-2xx
+   response (rate limit, transient 5xx) as well as on a genuinely absent tag.
+   Both callers took that fallback, so `apply()` could install an above-ceiling
+   daemon whose schema this build had never seen. A cross-family review found
+   this against the code; the code was fixed rather than the claim reworded.
+
+   The ceiling now **fails closed**: `select_verified_release()` returns an
+   error when no non-draft, non-prerelease release at or below the ceiling
+   exists, and the list endpoint's status is checked with `error_for_status()`.
+   An operator sees "refusing to update" naming the ceiling, and the remedy is
+   to bump the constant with its evidence. A node that cannot update is
+   recoverable; a node running an unverified daemon against a config nobody
+   validated is not. Tests: `update::tests::test_selection_fails_closed_*`.
 2. **The pin moves only with its evidence.** A bump is complete when, together:
    the ISO `ARG FIPS_VERSION` changes, `render_config_yaml()` matches the new
    schema, the verbatim upstream fixtures are refreshed, and the contract tests
@@ -55,13 +73,29 @@ config generated for v0.4.1 — a version nobody had verified.
    the pinned tag and fails on drift; `scripts/gen-fips-schema.py` re-extracts
    the valid key paths from upstream's `Deserialize` structs.
 3. **A schema claim is carried by a test, not a comment.**
-   `fips::config_upstream_contract` asserts every path the generated config
-   emits exists in the upstream schema at the pinned tag, and that the three
-   phantom keys and the deprecated table stay gone. Upstream's own
-   `fips.yaml` example documents only about a third of the schema — it does not
-   mention `node.retry.*` or `node.rate_limit.*`, both of which we set — so the
-   authority is the source structs, not the example text. The example is still
-   kept as a fixture, because it proves we read a real upstream artefact.
+   `fips::config_upstream_contract` asserts, in BOTH directions, that
+   `owned ⊆ emitted ⊆ schema`:
+
+   - `everything_we_own_is_actually_emitted` — every path this project
+     deliberately tunes appears in the rendered config;
+   - `emitted ⊆ schema` (`every_path_we_emit_is_valid_upstream`) — nothing is
+     emitted that upstream would silently drop;
+   - `every_owned_path_exists_upstream` — the owned list itself contains no key
+     upstream never defined;
+   - and the three phantom keys and the deprecated `node.discovery.*` table stay
+     gone.
+
+   The first direction was missing until a cross-family review pointed out that
+   `emitted ⊆ schema` is monotone in *shrinking* `emitted`: a renderer edit that
+   dropped `node.retry.*` would leave it vacuously true, and the exact-output
+   snapshot in `config.rs` would be updated to match — so the test meant to
+   catch a lost setting would have blessed its absence.
+
+   Upstream's own `fips.yaml` example documents only about a third of the
+   schema — it does not mention `node.retry.*` or `node.rate_limit.*`, both of
+   which we set — so the authority is the source structs, not the example text.
+   The example is still kept as a fixture, because it proves we read a real
+   upstream artefact.
 4. **The shipped version is v0.5.3.** The ISO pin moves from v0.4.1 to v0.5.3.
 5. **One supervisor for the daemon.** `archipelago-fips.service` declares
    `Conflicts=fips.service`. Both units run the same binary against the same
@@ -74,6 +108,12 @@ config generated for v0.4.1 — a version nobody had verified.
 - An updating node can no longer leave the verified config surface. Adopting a
   new upstream release becomes a deliberate act with a checklist, not a side
   effect of somebody clicking Update.
+- **Failing closed means an update can be REFUSED.** If upstream withdraws the
+  ceiling tag, or the release-list call is rate-limited, the node reports "no
+  stable upstream release at or below the verified ceiling" and installs
+  nothing. That is deliberate: a refused update is recoverable, and the message
+  names the ceiling and the remedy. The alternative — installing whatever
+  `/releases/latest` returns — is the failure this ADR exists to prevent.
 - **A node on v0.5.3 stops receiving updates until the cap is bumped.** That is
   the intent, but it means the cap is now maintenance debt: leaving it stale
   blocks legitimate upstream fixes. `check()` surfaces the newer release in its

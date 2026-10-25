@@ -227,12 +227,106 @@ Recorded because each one made the test look like it had PASSED:
 A fourth, found earlier: `fipsctl address` prints a **mesh IPv6 address**, not an
 npub, so feeding its output to `connect` yields `unknown host '<fd…>'`.
 
-## 10. Not yet verified
+## 10. Cross-family review and the resulting fixes
 
-- **Full bootable ISO.** The FIPS package is proven (§8); a `debootstrap` +
-  `mksquashfs` + `xorriso` ISO build was not run.
-- **Upgrade-in-place on a real node.** The smoke test boots fresh daemons. It
-  does not prove the mesh *returns* after upgrading an existing node with a
-  v0.4.1-shaped config in place — though that is the case
-  `VERIFIED_UPSTREAM_VERSION` exists to cap.
+A cold cross-family review returned `REQUEST_CHANGES` (reviewer_model
+`deepseek-flash`; published at
+https://github.com/felixfelix-bot/archy-fork/pull/1#issuecomment-6391384070).
+Two findings were real and are fixed here.
+
+### 11.1 The updater ceiling was advisory, not enforced
+
+**Finding (HIGH), confirmed against the code.** `fetch_verified_release()`
+filtered candidates to the ceiling and then, whenever no in-ceiling candidate
+survived, fell through to `fetch_latest_stable()` — the uncapped
+`/releases/latest` endpoint. That path was reached on a non-2xx list response
+(rate limit, transient 5xx) as well as on a genuinely absent tag, because the
+`if resp.status().is_success()` block simply ended. Both `check()` and
+`apply()` called it, so `apply()` could install an above-ceiling daemon whose
+config schema this build had never seen — the exact failure the ceiling exists
+to prevent. ADR-012 and the PR body claimed otherwise.
+
+**Fix.** Selection is extracted into a pure function and fails closed:
+
+```rust
+fn select_verified_release<'a>(releases: &'a [Release], ceiling: &str) -> Result<&'a Release>
+```
+
+It returns an error when no non-draft, non-prerelease release at or below the
+ceiling exists, and the error names the ceiling and the remedy. The list
+endpoint is now checked with `error_for_status()`. A refused update is
+recoverable; an unverified daemon on a live node is not.
+
+Tests (`update::tests`), all passing:
+
+- `test_selection_fails_closed_rather_than_uncapping` — no in-ceiling
+  candidate ⇒ error; empty list ⇒ error; only drafts/prereleases ⇒ error.
+  **This fails against the pre-fix revision**, so it is a regression guard
+  rather than a description.
+- `test_selection_picks_newest_within_the_ceiling` — the ceiling itself is
+  eligible and wins over older in-ceiling releases; a withdrawn ceiling
+  degrades to the next-newest *in-cap* release, never to an above-cap one.
+- `test_selection_is_semantic_not_lexical` — `v0.5.10` beats `v0.5.9`.
+
+### 11.2 The schema contract had only one direction
+
+**Finding (MEDIUM), confirmed.** `every_path_we_emit_is_valid_upstream` proved
+`emitted ⊆ schema`, but nothing proved `owned ⊆ emitted`. Since that relation is
+monotone in *shrinking* `emitted`, a renderer edit dropping `node.retry.*` would
+leave it vacuously true — and the exact-output snapshot in `config.rs` would
+simply be updated to match, so the test meant to catch a lost setting would have
+blessed its absence.
+
+**Fix.** `owned_paths()` now declares the tuning this project deliberately
+applies, with two new assertions:
+
+- `everything_we_own_is_actually_emitted` — the previously missing direction;
+- `every_owned_path_exists_upstream` — the owned list itself may not contain a
+  key upstream never defined, so the phantom-key defect cannot re-enter through
+  the allowlist.
+
+Both pass. The contract is now three-directional:
+`owned ⊆ emitted ⊆ schema`, with the schema fixture itself checked by
+`fixture_is_a_real_upstream_config`.
+
+## 11. Upgrade path rehearsed (new)
+
+`scripts/fips-upgrade-rehearsal.sh` covers the scenario the ADR exists for and
+which no earlier test touched: a node whose config is in the **pre-bump** shape
+(`node.discovery.*`, including the three phantom keys) must accept the
+**post-bump** config with the **same identity** and re-peer.
+
+```
+$ sudo bash scripts/fips-upgrade-rehearsal.sh
+OK:   old config really uses node.discovery.* (the pre-bump shape)
+OK:   pre-bump config peers (a=1 b=1)
+OK:   node a new config uses node.lookup.* + node.rendezvous.*
+OK:   node a identity preserved across the rewrite
+OK:   node a accepted the post-bump config (no parse/validate error)
+OK:   node b accepted the post-bump config (no parse/validate error)
+OK:   re-peered after the config rewrite (a=1 b=1)
+OK:   same peer relationship as before the rewrite (node b present both times)
+RESULT: PASS
+```
+
+The identity check is load-bearing: without it, "re-peered" would be
+indistinguishable from "two brand-new nodes met".
+
+### Limits, stated rather than implied
+
+- The daemon binary is the **installed** 0.5.3. This rehearses the config
+  migration and the daemon's acceptance of it — **not** a `.deb` upgrade from
+  v0.4.1, which needs that package and a real dpkg transaction.
+- It does not exercise archipelago's own `sudo install` of `fips.yaml`, nor the
+  unit-file swaps around it.
+- Both nodes start fresh on the old config and are then rewritten; it is not a
+  long-running node with accumulated state.
+
+## 12. Not yet verified
+
+- **Full bootable ISO.** The FIPS package is proven (§8). A full
+  `build-iso-release.sh` run is blocked on this branch by its own preflight
+  (requires branch `main`, a clean tree, and a signed manifest tag) — that is a
+  release-ceremony action, not a feature-branch one.
+- **Real `.deb` upgrade v0.4.1 → v0.5.3** on a live node (§11 limit).
 - **Android companion.** Out of scope by design — see ADR-012.
