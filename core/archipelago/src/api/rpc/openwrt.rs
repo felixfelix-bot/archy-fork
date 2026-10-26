@@ -3,8 +3,9 @@ use crate::network::router as net_router;
 use anyhow::{Context, Result};
 use archipelago_openwrt::{
     detect,
+    opkg::PkgManager,
     router::Router,
-    tollgate::{self, TollGateConfig},
+    tollgate::{self, version::Installed, TollGateConfig},
     wan, wifi_scan,
 };
 
@@ -130,19 +131,51 @@ impl RpcHandler {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
 
-                // TollGate — check via opkg (≤24.x) or binary presence (25.x apk-native).
-                // The service binary is /usr/bin/tollgate-wrt (per its init.d script),
-                // not /usr/bin/tollgate-module-basic-go — that's only the opkg/apk
-                // *package* name, never an on-disk filename.
-                let tollgate_installed = router
-                    .run("opkg list-installed 2>/dev/null | grep -q '^tollgate-module-basic-go ' || \
-                          test -f /usr/bin/tollgate-wrt 2>/dev/null")
-                    .map(|(_, code)| code == 0)
-                    .unwrap_or(false);
+                // TollGate — presence AND version.
+                //
+                // This probe used to be presence-only, and it used the
+                // repository name (`tollgate-module-basic-go`) as if it were a
+                // package name. The package is `tollgate-wrt`, so that grep
+                // could never match and every bit of information came from the
+                // file-existence fallback — which says nothing about version.
+                //
+                // The consequence was that a version bump was invisible: the
+                // dashboard reported "installed" identically for 0.5.0 and
+                // 0.6.0, so the one question this release has to answer —
+                // "did the pin actually take effect?" — could not be asked.
+                // Detect the manager for the *reported* value only. The version
+                // read must not depend on that detection succeeding: guessing a
+                // manager here would run its listing on a router that may not
+                // have it, which fails, parses as `Absent`, and reports a
+                // healthy router as "not installed". Ask both listings instead.
+                let pkg_mgr = router.pkg_manager().ok();
+                let installed_version = tollgate::installed_tollgate_version_any(&router);
+                let tollgate_installed = !matches!(installed_version, Installed::Absent);
 
                 let tollgate = if tollgate_installed {
+                    // Whether the installed build matches the version this
+                    // binary would install. Reported as its own field rather
+                    // than folded into `installed`, so "wrong version" is
+                    // visible instead of looking like success.
+                    let desired = tollgate::package_version_from_pin(tollgate::TOLLGATE_VERSION)
+                        .unwrap_or_else(|_| tollgate::TOLLGATE_VERSION.trim_start_matches('v').to_string());
+                    let version_str = match &installed_version {
+                        Installed::Version(v) => v.clone(),
+                        Installed::UnknownVersion => String::new(),
+                        Installed::Absent => String::new(),
+                    };
+                    let up_to_date = installed_version.satisfies(&desired);
+
                     serde_json::json!({
                         "installed": true,
+                        "version": version_str,
+                        "version_known": matches!(installed_version, Installed::Version(_)),
+                        "pinned_version": desired,
+                        "up_to_date": up_to_date,
+                        "pkg_manager": pkg_mgr.map(|m| match m {
+                            PkgManager::Opkg => "opkg",
+                            PkgManager::ApkNative => "apk",
+                        }),
                         "enabled":       router.uci_get("tollgate.main.enabled").map(|v| v == "1").unwrap_or(false),
                         "metric":        router.uci_get("tollgate.main.metric").unwrap_or_default(),
                         "step_size_ms":  router.uci_get("tollgate.main.step_size").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
@@ -153,7 +186,13 @@ impl RpcHandler {
                         "payout_address":router.uci_get("tollgate.main.payout_address").unwrap_or_default(),
                     })
                 } else {
-                    serde_json::json!({ "installed": false })
+                    serde_json::json!({
+                        "installed": false,
+                        "version": "",
+                        "version_known": false,
+                        "pinned_version": tollgate::TOLLGATE_VERSION.trim_start_matches('v'),
+                        "up_to_date": false,
+                    })
                 };
 
                 // WiFi interfaces

@@ -28,6 +28,39 @@ impl Router {
     ///   `apk add opkg`.  If opkg is in the repos → `Opkg`.  If not (OpenWrt
     ///   25.x) → `ApkNative`.
     /// - Neither found → error.
+    ///
+    /// Which package manager is present — WITHOUT changing the router.
+    /// [`opkg_check`](Self::opkg_check) is a provisioning step, not a query: it
+    /// rewrites `/etc/apk/repositories` to plaintext HTTP, runs `apk update`, and
+    /// `apk add opkg`. Calling it from a read path (the dashboard's status RPC)
+    /// therefore downgraded a router's package transport and installed software
+    /// on every poll, and made an already-slow SSH round-trip slower.
+    ///
+    /// This probe only asks what is on `$PATH`. It never writes, and a failure
+    /// returns an error rather than guessing — a guessed manager makes the next
+    /// version probe report `Absent` for a router that is fine, which reads as
+    /// "not installed" and is exactly the kind of silent wrong answer this
+    /// module exists to prevent.
+    pub fn pkg_manager(&self) -> Result<PkgManager> {
+        let (_, opkg) = self.run("command -v opkg >/dev/null 2>&1")?;
+        if opkg == 0 {
+            return Ok(PkgManager::Opkg);
+        }
+        let (_, apk) = self.run("command -v apk >/dev/null 2>&1")?;
+        if apk == 0 {
+            return Ok(PkgManager::ApkNative);
+        }
+        anyhow::bail!(
+            "Neither opkg nor apk found on this router's $PATH — its firmware may not \
+             support package management (TollGate requires a standard OpenWrt build)"
+        )
+    }
+
+    /// Which package manager this router should use, provisioning `opkg` if the
+    /// image is apk-native and its repos carry one.
+    ///
+    /// This MUTATES the router (see the doc comment above). Call it from
+    /// provisioning only.
     pub fn opkg_check(&self) -> Result<PkgManager> {
         let (_, code) = self.run("command -v opkg >/dev/null 2>&1")?;
         if code == 0 {
@@ -127,5 +160,57 @@ impl Router {
         info!("[{}] apk add {}", self.host, package);
         self.run_ok(&format!("apk add {}", package))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // These assert the SHAPE of the two probes, because the defect they guard
+    // against is a shape defect: a read path must not mutate the router, and a
+    // version-aware caller must not use the name-only install shortcut. Both are
+    // invisible to a green functional suite — the router still answers, it just
+    // answers after being changed.
+
+    /// `opkg_check` MUST stay obviously mutating, so nobody wires it into a read
+    /// path again. It rewrites the repository URLs and installs a package.
+    #[test]
+    fn opkg_check_is_a_mutating_provisioning_step() {
+        let src = include_str!("opkg.rs");
+        let body = src
+            .split("pub fn opkg_check")
+            .nth(1)
+            .expect("opkg_check exists");
+        let body = &body[..body.find("\n    /// `opkg update`").unwrap_or(body.len())];
+        assert!(
+            body.contains("sed -i"),
+            "opkg_check must not lose its repository rewrite without also \
+             ceasing to be documented as mutating"
+        );
+        assert!(
+            body.contains("apk add opkg"),
+            "opkg_check installs opkg; if that is removed, the read/write split \
+             should be reconsidered rather than silently widened"
+        );
+    }
+
+    /// The non-mutating probe must contain only `command -v` lookups.
+    #[test]
+    fn the_read_path_probe_never_writes() {
+        let src = include_str!("opkg.rs");
+        let body = src
+            .split("pub fn pkg_manager")
+            .nth(1)
+            .expect("pkg_manager exists");
+        let body = &body[..body
+            .find("\n    /// Which package manager")
+            .unwrap_or(body.len())];
+        for forbidden in ["sed -i", "apk add", "apk update", "run_ok("] {
+            assert!(
+                !body.contains(forbidden),
+                "pkg_manager must never mutate the router, but it contains {forbidden:?}"
+            );
+        }
+        assert!(body.contains("command -v opkg"));
+        assert!(body.contains("command -v apk"));
     }
 }

@@ -9,6 +9,7 @@ case "${ARCHY_TEST_PACKAGE:-archipelago}" in
   archipelago) test_target=(-p archipelago --bin archipelago) ;;
   archipelago-publishing-tests) test_target=(-p archipelago-publishing-tests --lib) ;;
   archipelago-container) test_target=(-p archipelago-container --lib) ;;
+  archipelago-openwrt) test_target=(-p archipelago-openwrt --lib) ;;
   *) echo 'Unsupported isolated test package' >&2; exit 2 ;;
 esac
 

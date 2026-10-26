@@ -121,9 +121,10 @@ fn provision_firewall(router: &Router) -> Result<()> {
 /// Fold the upstream `tollgate-module-basic-go` installer's own default
 /// AP(s) onto the gated `tollgate` network.
 ///
-/// `install::install_ipk` runs the package's `/etc/uci-defaults/*` first-boot
-/// scripts itself (no real package manager to trigger them on OpenWrt 25.x —
-/// see its doc comment). Those upstream scripts rebrand OpenWrt's
+/// The package's own `postinst` runs its `/etc/uci-defaults/*` first-boot
+/// scripts on every install and upgrade (both install paths now go through the
+/// real package manager, so `default_postinst` sees the file list). Those
+/// upstream scripts rebrand OpenWrt's
 /// factory-default wifi sections (`wireless.default_radioN`, present on
 /// every fresh install) to a `TollGate-<serial>` SSID, but only ever touch
 /// the SSID — they leave `network` at its original `lan` binding. Nothing
