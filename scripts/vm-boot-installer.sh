@@ -20,12 +20,20 @@
 # A virtio CD would still show as sr0, but SATA keeps the whole chain on the
 # device names the installer actually probes.
 #
+# ## Why 40 GB and not 24
+#
+# The installer's partitioning step hardcodes a layout that places a partition
+# at 30 GiB. On a smaller disk it aborts at [3/8] Creating partitions with:
+#     Error: The location 30GiB is outside of the device /dev/sda.
+# 24 GB was observed to fail this way; 40 GB leaves headroom above the 30 GiB
+# floor for the root filesystem.
+#
 # Usage: scripts/vm-boot-installer.sh --iso <path> [--ram 3072] [--cpus 2]
-#                                      [--disk-gb 24] [--timeout 1800]
+#                                      [--disk-gb 40] [--timeout 1800]
 #                                      [--keep]
 set -uo pipefail
 
-ISO=""; RAM=3072; CPUS=2; DISK_GB=24; TIMEOUT=1800; KEEP=0
+ISO=""; RAM=3072; CPUS=2; DISK_GB=40; TIMEOUT=1800; KEEP=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --iso)      ISO="${2:?}"; shift ;;
