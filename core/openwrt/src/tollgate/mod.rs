@@ -75,6 +75,36 @@ pub async fn provision(router: &Router, config: &TollGateConfig) -> Result<()> {
     nodogsplash::configure(router, config)
         .context("configure nodogsplash — tollgate-wrt cannot gate clients without it")?;
 
+    // Post-condition, not a repair. The package's postinst runs its own
+    // uci-defaults during the install at the top of this function, and on a
+    // version-changing install those rewrite `gatewayinterface` to `br-lan` on
+    // the section `configure` just built (verified against the shipped v0.6.0
+    // script — see `nodogsplash::assert_gateway_interface_is_paid_bridge`).
+    // `configure` above already overwrote that value, because it runs after
+    // the install, so on the normal path this finds the value correct and
+    // writes nothing. What it buys is that a provision can no longer return Ok
+    // while the gateway is pinned to the wrong bridge: if `configure`'s write
+    // did not stick, or someone reorders this function, provisioning fails
+    // here instead of leaving a router that gates its own management LAN.
+    match nodogsplash::assert_gateway_interface_is_paid_bridge(router)? {
+        nodogsplash::GatewayInterfaceCheck::Correct => {
+            info!(
+                "[{}] nodogsplash gatewayinterface is {} — enforced bridge matches the paid bridge",
+                router.host,
+                nodogsplash::PAID_BRIDGE
+            );
+        }
+        nodogsplash::GatewayInterfaceCheck::Repaired(previous) => {
+            info!(
+                "[{}] nodogsplash gatewayinterface was '{}' after configure — re-pinned to {} \
+                 and restarted the daemon",
+                router.host,
+                previous,
+                nodogsplash::PAID_BRIDGE
+            );
+        }
+    }
+
     restart_services(router, config.enabled)?;
     nodogsplash::restart(router)?;
 

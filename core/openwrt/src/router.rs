@@ -10,9 +10,25 @@ pub struct Router {
     pub host: String,
     pub port: u16,
     session: Session,
+    #[cfg(test)]
+    command: Option<Box<TestCommand>>,
 }
 
+#[cfg(test)]
+type TestCommand = dyn Fn(&str) -> Result<(String, i32)> + Send + Sync;
+
 impl Router {
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        command: impl Fn(&str) -> Result<(String, i32)> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            host: "scripted".into(),
+            port: 0,
+            session: Session::new().unwrap(),
+            command: Some(Box::new(command)),
+        }
+    }
     /// Bounded TCP connect. The OS default connect timeout against an
     /// unreachable RFC1918 address is ~2 minutes; a router that stayed
     /// behind when its node moved networks turned every status poll into a
@@ -51,6 +67,8 @@ impl Router {
             host: host.to_string(),
             port,
             session,
+            #[cfg(test)]
+            command: None,
         })
     }
 
@@ -69,11 +87,17 @@ impl Router {
             host: host.to_string(),
             port,
             session,
+            #[cfg(test)]
+            command: None,
         })
     }
 
     /// Run a command and return (stdout, exit_code).
     pub fn run(&self, cmd: &str) -> Result<(String, i32)> {
+        #[cfg(test)]
+        if let Some(command) = &self.command {
+            return command(cmd);
+        }
         debug!("ssh [{}] $ {}", self.host, cmd);
 
         let mut channel = self.session.channel_session().context("open channel")?;

@@ -178,6 +178,119 @@ installed:
 Anyone who joins the `archipelago` SSID sees TollGate's captive portal and
 pays sats (via the configured Cashu mint) for timed access.
 
+### ⚠️ Known limitation: the paid bridge may not be the enforced bridge
+
+**As of the v0.6.0 pin, a router can install, run, accept payments, and still
+not gate the `archipelago` SSID.** Verify enforcement explicitly rather than
+trusting the success message.
+
+Archipelago puts the paid SSID on its own bridge, `br-tollgate`
+(192.168.99.1/24), deliberately — see `wifi.rs`. **Measured on a live router
+after a clean v0.6.0 install, the nodogsplash gateway interface is `br-lan`,
+not `br-tollgate`:**
+
+```sh
+uci get nodogsplash.@nodogsplash[0].gatewayinterface
+# -> br-lan
+```
+
+> **This is branch-gated, and a re-provision can mask it.** Measured on a fresh
+> OpenWrt 25.12.5 x86/64 guest against the shipped v0.6.0 artifact: the package's
+> `postinst` runs `99-tollgate-setup`, which writes `br-lan`. Which branch it
+> takes depends on `/etc/tollgate-setup-done`, and the script logs its own
+> decision:
+>
+> * marker missing or **older** → `Setup branch FULL` — writes `br-lan`.
+> * marker **matches** → `Setup branch VERIFY` — does not touch the value.
+>
+> Measured: a same-version `apk add` takes VERIFY and leaves `br-tollgate`
+> alone; a version-changing install takes FULL and puts `br-lan` back. So the
+> value depends on the install that ran, not on how many times you provisioned.
+> Archipelago's `nodogsplash::configure` runs after the install and overwrites
+> it, so `br-tollgate` is correct after a provision — but check it for the state
+> you actually care about, and re-check after any version-changing install or
+> upgrade. `br-tollgate` itself may not exist on a guest with no wireless radio,
+> because that bridge is created by Archipelago's own `provision_ssid`.
+
+
+The mechanism is in the package the pin actually serves. Extract the released
+`.ipk` — the one whose SHA-256 matches the release `SHA256SUMS` — and read it,
+rather than searching the feed repository, whose tree lists only the feed-side
+overlay:
+
+```sh
+curl -LO https://github.com/FreedomTechFeed/packages/releases/download/v0.6.0/tollgate-wrt_0.6.0_x86_64-x86-64.ipk
+sha256sum tollgate-wrt_0.6.0_x86_64-x86-64.ipk   # must match SHA256SUMS
+tar -xzf tollgate-wrt_0.6.0_x86_64-x86-64.ipk    # the v0.6.0 ipk is a gzip tar
+tar -xzf data.tar.gz
+grep -n gatewayinterface etc/uci-defaults/99-tollgate-setup
+grep -c 'iifname "br-lan"' etc/nftables.d/20-nds-enforce.nft
+```
+
+Both files are shipped (the feed stages the module's whole `packaging/files`
+tree), and both hardcode the management bridge:
+
+* `etc/uci-defaults/99-tollgate-setup:1827` —
+  `uci set nodogsplash.@nodogsplash[0].gatewayinterface='br-lan'`
+* `etc/nftables.d/20-nds-enforce.nft` — four `iifname "br-lan"` matches
+* zero references to `br-tollgate` anywhere in the extracted tree
+
+So the `br-lan` value is not a race and not an inference: it is what the
+package's own first-boot script writes. It is re-applied whenever `postinst`
+takes the FULL branch — i.e. on a fresh install and on any version-changing
+upgrade — and skipped when the marker already matches.
+
+
+> A previous revision of this note retracted these citations on the grounds that
+> the package ships `91-tollgate-admin-ui-mode` and `92-tollgate-admin-setup`
+> instead. That was wrong, and it was checked against the feed *repository*
+> rather than the released artefact: the shipped `etc/uci-defaults/` is
+> `90-tollgate-captive-portal-symlink`, `91-tollgate-admin-ui-mode`,
+> `99-tollgate-setup`, `999-tollgate-admin-setup` — `99-tollgate-setup` is
+> present, and `92-tollgate-admin-setup` is a feed-side filename that installs as
+> `999`. Check the tarball, not the repo tree.
+
+Archipelago deletes the anonymous nodogsplash section and pins
+`gatewayinterface` to `br-tollgate` itself. The ordering matters and is worth
+stating precisely: `postinst` runs `99-tollgate-setup` during the install, and
+Archipelago's `nodogsplash::configure` runs after that, so on a successful
+provision Archipelago's value wins — and it is `configure`, not the post-check
+that follows it, that does the winning. `provision` then reads the value back
+and fails if it is not `br-tollgate`, so a provision can no longer report
+success while the gateway is pinned to the wrong bridge.
+
+What is *not* guaranteed is that it stays won. Any **version-changing** package
+install or upgrade re-runs `postinst`, which takes the script's FULL branch and
+writes `br-lan` again, with nothing re-asserting `br-tollgate` until the next
+provision. Treat the value as perishable and re-check it after any upgrade,
+rather than as a one-time invariant. (A same-version reinstall takes the
+VERIFY branch and leaves the value alone, which is why the symptom can look
+intermittent.)
+
+**How to check** (on the router, after provisioning):
+
+```sh
+uci get nodogsplash.@nodogsplash[0].gatewayinterface   # must read br-tollgate
+ndsctl status | grep -i 'Managed interface'            # must read br-tollgate
+ip -4 addr show br-tollgate | grep inet                # the paid bridge exists
+```
+
+`ndsctl status` on nodogsplash 5.0.2 has **no** line containing
+`gatewayinterface`; the line is `Managed interface: <if>`. Grepping for
+`gatewayinterface` returns nothing on a correct router too, so it cannot be
+used as a check. Cross-check the rendered config as the third source:
+
+```sh
+grep -i '^GatewayInterface' /tmp/etc/nodogsplash_main.conf
+```
+
+If the gateway interface reads `br-lan`, **payments open the gate on the
+router's management LAN rather than on the paid SSID** — that is the failure
+mode this note exists to stop shipping silently. It also firewalls the
+management bridge: measured on the lab guest, a drifted router **refused SSH**
+on its own LAN address and its `ndsRTR` chain counted the rejects, so the
+operator's laptop is treated as an unpaid customer.
+
 ## Verifying a successful install
 
 A clean install (flash → Connect → WAN/WISP → Install TollGate, all through
