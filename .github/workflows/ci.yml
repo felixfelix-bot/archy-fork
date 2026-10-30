@@ -7,7 +7,12 @@ on:
     branches: [main]
 
 env:
-  RUST_VERSION: stable
+  # Pinned deliberately. With `stable`, clippy floats with Rust releases, so a
+  # tree that shipped green turns red when a new lint lands — main went red on
+  # 2026-10-26 with 195 findings that were all new lints, not new bugs. Bumping
+  # this is a deliberate act with a green run behind it, not a side effect of
+  # whenever CI next starts.
+  RUST_VERSION: 1.99.1
   NODE_VERSION: 20
 
 jobs:
