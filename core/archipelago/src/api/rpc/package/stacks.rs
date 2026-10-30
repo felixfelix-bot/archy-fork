@@ -1076,7 +1076,7 @@ impl RpcHandler {
         let images = [
             &format!("{}/postgres:15.17", REGISTRY),
             &format!("{}/nbxplorer:2.6.0", REGISTRY),
-            "docker.io/btcpayserver/btcpayserver:2.4.2",
+            "docker.io/btcpayserver/btcpayserver:2.4.3",
         ];
         self.set_install_phase("btcpay-server", InstallPhase::PullingImage)
             .await;
@@ -1233,7 +1233,7 @@ impl RpcHandler {
                     "BTCPAY_POSTGRES=User ID=btcpay;Password={};Host=archy-btcpay-db;Port=5432;Database=btcpay;Include Error Detail=true",
                     db_pass
                 ),
-                "docker.io/btcpayserver/btcpayserver:2.4.2",
+                "docker.io/btcpayserver/btcpayserver:2.4.3",
             ])
             .output()
             .await

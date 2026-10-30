@@ -12,7 +12,9 @@ on:
         default: '0.1.0'
 
 env:
-  RUST_VERSION: stable
+  # Pinned to match ci.yml: a floating `stable` turns a green tree red when a
+  # new lint ships. Bump deliberately, with a green run behind it.
+  RUST_VERSION: 1.99.1
   NODE_VERSION: 18
 
 jobs:

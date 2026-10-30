@@ -49,13 +49,23 @@ it('does not start a poll timer after navigating away during initial identity lo
   vi.mocked(rpcClient.getNodeDid).mockReturnValueOnce(new Promise(done => { resolve = done }))
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: Federation }] })
   await router.push('/')
-  const timer = vi.spyOn(globalThis, 'setInterval')
+  // Spy on BOTH halves and assert the invariant that actually matters: an
+  // interval scheduled after the component went away must be cleared, not left
+  // running. Asserting "setInterval was never called anywhere" is a global
+  // claim in a suite that mounts other pollers (useElectrsSync, useBitcoinSync,
+  // useMessageToast all own timers), so an unrelated one starting between the
+  // spy and the assertion fails this test for no reason — which is how it
+  // flaked in CI while passing in isolation and as a full local run.
+  const started = vi.spyOn(globalThis, 'setInterval')
+  const stopped = vi.spyOn(globalThis, 'clearInterval')
   const wrapper = shallowMount(Federation, { global: { plugins: [router] } })
   wrapper.unmount()
   resolve({ did: 'did:key:late', pubkey: 'fixture' })
   await flushPromises()
-  expect(timer).not.toHaveBeenCalled()
-  timer.mockRestore()
+  const leaked = started.mock.calls.length - stopped.mock.calls.length
+  expect(leaked, `an interval was started and never cleared after unmount (${started.mock.calls.length} started, ${stopped.mock.calls.length} cleared)`).toBeLessThanOrEqual(0)
+  started.mockRestore()
+  stopped.mockRestore()
 })
 
 it('opens an existing peer deep link and clears it when the detail closes', async () => {
